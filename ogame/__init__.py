@@ -2,15 +2,32 @@ import re
 import requests
 import unittest
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import random
+import time
+import os
+
+# Blackbox
+import base64
+from random import randint
+from urllib.parse import quote
+
+# Captcha
+import io
+from PIL import Image
+import imagehash
+import cv2
+import shutil
+from pytesseract import image_to_string
 
 try:
     import constants as const
 except ImportError:
     import ogame.constants as const
+
+user_agent_raw = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
 
 
 class OGame(object):
@@ -19,133 +36,327 @@ class OGame(object):
             universe,
             username,
             password,
-            token=None, user_agent=None, proxy='',
-            language=None, server_number=None
+            is_pioneer=False,
+            token=None, proxy='',
+            language=None, server_number=None, blackbox_token=None
     ):
         self.universe = universe
         self.username = username
         self.password = password
-        self.user_agent = {'User-Agent': user_agent}
         self.proxy = proxy
         self.language = language
         self.server_number = server_number
+        self.is_pioneer = is_pioneer
         self.session = requests.Session()
         self.session.proxies.update({'https': self.proxy})
         self.token = token
-        if self.user_agent is None:
-            self.user_agent = {
-                'User-Agent':
-                    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-                    '(KHTML, like Gecko) Chrome/88.0.4324.182 Safari/537.36'
-            }
+        self.blackbox_token = blackbox_token
+        self.user_agent_raw = user_agent_raw
+        self.user_agent = {
+            'User-Agent': f'{self.user_agent_raw}'
+        }
         self.session.headers.update(self.user_agent)
 
-        if token is None:
-            self.login()
-        else:
-            self.session.headers.update(
-                {'authorization': 'Bearer {}'.format(token)}
-            )
-            accounts = self.session.get(
-                url='https://lobby.ogame.gameforge.com'
-                    '/api/users/me/accounts'
-            ).json()
-            if 'error' in accounts:
-                del self.session.headers['authorization']
+        try:
+            if token is None:
+                print("Login without Token")
                 self.login()
+            else:
+                print("Login with Token")
+                self.session.headers.update(
+                    {'authorization': f'Bearer {token}'}
+                )
+                self.set_cookies_and_accounts()
 
-        servers = self.session.get(
-            url='https://lobby.ogame.gameforge.com/api/servers'
-        ).json()
-        for server in servers:
-            if server['name'] == self.universe:
-                self.server_number = server['number']
-                break
-            elif server['name'] == self.universe and self.language is None:
-                self.server_number = server['number']
-                break
-        assert self.server_number is not None, "Universe not found"
+            self.get_server_number_and_language()
 
-        accounts = self.session.get(
-            url='https://lobby.ogame.gameforge.com/api/users/me/accounts'
-        ).json()
-        for account in accounts:
-            if account['server']['number'] == self.server_number \
-                    and account['server']['language'] == self.language:
-                self.server_id = account['id']
-                break
-            elif account['server']['number'] == self.server_number \
-                    and self.language is None:
-                self.server_id = account['id']
-                self.language = account['server']['language']
-                break
+            self.set_server_id()
 
-        self.index_php = 'https://s{}-{}.ogame.gameforge.com/game/index.php?' \
-            .format(self.server_number, self.language)
-        login_link = self.session.get(
-            url='https://lobby.ogame.gameforge.com/api/users/me/loginLink?',
-            params={'id': self.server_id,
-                    'server[language]': self.language,
-                    'server[number]': self.server_number,
-                    'clickedButton': 'account_list'}
-        ).json()
-        self.landing_page = self.session.get(login_link['url']).text
-        self.landing_page = self.session.get(
-            self.index_php + 'page=ingame'
-        ).text
-        self.landing_page = BeautifulSoup4(self.landing_page)
+            self.index_php = f'https://s{self.server_number}-{self.language}.ogame.gameforge.com/game/index.php?'
 
-        self.player = self.landing_page.find(
-            'meta', {'name': 'ogame-player-name'}
-        )['content']
-        self.player_id = int(self.landing_page.find(
-            'meta', {'name': 'ogame-player-id'}
-        )['content'])
+            self.blackbox_token = get_blackbox()
+
+            self.set_headers_and_cookies()
+
+            params = {
+                "id": self.server_id,
+                "server": {
+                    "language": self.language,
+                    "number": self.server_number
+                },
+                "clickedButton": "quick_join",
+                "blackbox": f"tra:{self.blackbox_token}"
+            }
+
+            login_url = self.get_login_link(params)
+
+            self.landing_page = self.session.get(login_url).text
+
+            self.landing_page = self.session.get(
+                self.index_php + 'page=ingame'
+            ).text
+
+            self.landing_page = BeautifulSoup4(self.landing_page)
+
+            self.player = self.landing_page.find(
+                'meta', {'name': 'ogame-player-name'}
+            )['content']
+            self.player_id = int(self.landing_page.find(
+                'meta', {'name': 'ogame-player-id'}
+            )['content'])
+
+            print(f'Player ID: {self.player_id}')
+
+            del self.session.headers['authorization']
+        except Exception as e:
+            print(e)
 
     def login(self):
-        self.session.get('https://lobby.ogame.gameforge.com/')
-        login_data = {
+
+        try:
+            self.session.get('https://lobby.ogame.gameforge.com/')
+            self.blackbox_token = get_blackbox()
+            login_data = self._build_login_data()
+
+            response = self.session.post(
+                'https://gameforge.com/api/v1/auth/thin/sessions',
+                json=login_data
+            )
+
+            if response.status_code == 409:
+                self._handle_captcha(response)
+            elif response.status_code == 201:
+                print(f'Login ok')
+            else:
+                print(f'DEBUG error code: {response.status_code}')
+                raise ValueError(f"Unexpected response status code: {response.status_code} {response.text}")
+
+            self._handle_login_success(response)
+
+        except Exception as e:
+            print(f'error: {e}')
+            raise
+
+    def _build_login_data(self):
+        game_environment_id = '0a31d605-ffaf-43e7-aa02-d06df7116fc8'
+        platform_game_id = '1dfd8e7e-6e1a-4eb1-8c64-03c3b62efd2f'
+
+        if self.is_pioneer:
+            game_environment_id = '1dfd8e7e-6e1a-4eb1-8c64-03c3b62efd2f'
+            platform_game_id = 'b990cab3-3573-4605-965a-0693c0adde26'
+
+        return {
             'identity': self.username,
             'password': self.password,
-            'locale': 'en_EN',
-            'gfLang': 'en',
-            'platformGameId': '1dfd8e7e-6e1a-4eb1-8c64-03c3b62efd2f',
-            'gameEnvironmentId': '0a31d605-ffaf-43e7-aa02-d06df7116fc8',
-            'autoGameAccountCreation': False
+            'locale': 'de_DE',
+            'gfLang': self.language,
+            'platformGameId': platform_game_id,
+            'gameEnvironmentId': game_environment_id,
+            'autoGameAccountCreation': False,
+            'blackbox': 'tra:{}'.format(self.blackbox_token)
         }
-        response = self.session.post(
-            'https://gameforge.com/api/v1/auth/thin/sessions',
-            json=login_data
+
+    def _handle_captcha(self, response):
+
+        gfchallengeid = response.headers['gf-challenge-id'].replace(';https://challenge.gameforge.com', '')
+
+        response2 = self.session.get(
+            url='https://challenge.gameforge.com/challenge/' + gfchallengeid
         )
-        if response.status_code == 409:
-            self.solve_captcha(
-                response.headers['gf-challenge-id']
-                .replace(';https://challenge.gameforge.com', '')
+
+        response3 = self.session.get(
+            url='https://image-drop-challenge.gameforge.com/challenge/' + gfchallengeid + '/en-GB'
+        ).json()
+
+        lastupdated = response3['lastUpdated']
+
+        captcha_required = True
+        while captcha_required:
+
+            response4 = self.session.get(
+                url='https://image-drop-challenge.gameforge.com/challenge/'
+                    + gfchallengeid
+                    + '/en-GB/text?'
+                    + str(lastupdated)
             )
-            self.login()
-            return True
-        assert response.status_code != 409, 'Resolve the Captcha'
-        assert response.status_code == 201, 'Bad Login'
+
+            challenge_text = response4.content
+
+            response5 = self.session.get(
+                url='https://image-drop-challenge.gameforge.com/challenge/'
+                    + gfchallengeid
+                    + '/en-GB/drag-icons?'
+                    + str(lastupdated)
+            )
+
+            challenge_icons = response5.content
+
+            response6 = self.session.get(
+                url='https://image-drop-challenge.gameforge.com/challenge/'
+                    + gfchallengeid
+                    + '/en-GB/drop-target?'
+                    + str(lastupdated)
+            )
+
+            answer = solve_captcha(challenge_text, challenge_icons)
+
+            payload7 = {
+                'answer': int(answer)
+            }
+
+            # Post answer
+            response7 = self.session.post(
+                url='https://image-drop-challenge.gameforge.com/challenge/'
+                    + gfchallengeid
+                    + '/en-GB',
+                json=payload7
+            ).json()
+
+            if response7['status'] == 'presented':
+                print('next captcha required')
+                lastupdated = response7['lastUpdated']
+            elif response7['status'] == 'solved':
+                captcha_required = False
+
+        self.login()
+
+    def _handle_login_success(self, response):
         self.token = response.json()['token']
+        with open(os.path.abspath(os.path.join(os.getcwd(), 'bearer_token.txt')), 'w') as f_token:
+            f_token.write(self.token)
         self.session.headers.update(
             {'authorization': 'Bearer {}'.format(self.token)}
         )
 
-    def solve_captcha(self, challenge):
-        response = self.session.get(
-            url='https://image-drop-challenge.gameforge.com/challenge/{}/en-GB'
-                .format(challenge)
-        ).json()
-        assert response['status'] == 'presented'
-        response = self.session.post(
-            url='https://image-drop-challenge.gameforge.com/challenge/{}/en-GB'
-                .format(challenge),
-            json={"answer": 0}
-        ).json()
-        if response['status'] == 'solved':
-            return True
+        # Set the cookies
+        cookies = {
+            "gf-token-production": "{}".format(self.token)
+        }
+
+        self.session.cookies.update(cookies)
+
+    def set_cookies_and_accounts(self):
+        # Update the session headers with the token
+        self.session.headers.update(
+            {'authorization': f'Bearer {self.token}'}
+        )
+
+        # Set the cookies
+        cookies = {
+            "gf-token-production": f"{self.token}"
+        }
+        self.session.cookies.update(cookies)
+
+        # Get the accounts
+        if self.is_pioneer == 1:
+            accounts = self.session.get(
+                url='https://lobby-pioneers.ogame.gameforge.com/api/users/me/accounts'
+            ).json()
         else:
-            self.solve_captcha(challenge)
+            accounts = self.session.get(
+                url='https://lobby.ogame.gameforge.com/api/users/me/accounts'
+            ).json()
+
+        # Set the language from the first account if not already set
+        if self.language is None:
+            self.language = accounts[0]['server']['language']
+
+        # If there's an error in the accounts, remove the authorization header and call the login function
+        if 'error' in accounts:
+            del self.session.headers['authorization']
+            self.login()
+
+    def get_server_number_and_language(self):
+        # Get the server list
+        if self.is_pioneer == 1:
+            servers = self.session.get(
+                url='https://lobby-pioneers.ogame.gameforge.com/api/servers'
+            ).json()
+        else:
+            servers = self.session.get(
+                url='https://lobby.ogame.gameforge.com/api/servers'
+            ).json()
+
+        # Find the matching server and set the server_number and language
+        for server in servers:
+            if server['name'] == self.universe and self.is_pioneer == 1:
+                self.server_number = server['number']
+                self.language = server['language']
+                break
+            elif server['name'] == self.universe:
+                self.server_number = server['number']
+                if self.language is None:
+                    self.language = server['language']
+                break
+            elif server['name'] == self.universe and self.language is None:
+                self.server_number = server['number']
+                break
+
+        # Check if the server_number was found, otherwise raise an error
+        if self.server_number is None:
+            raise ValueError("Universe not found")
+
+    def set_server_id(self):
+        # Get the accounts
+        if self.is_pioneer == 1:
+            accounts = self.session.get(
+                url='https://lobby-pioneers.ogame.gameforge.com/api/users/me/accounts'
+            ).json()
+        else:
+            accounts = self.session.get(
+                url='https://lobby.ogame.gameforge.com/api/users/me/accounts'
+            ).json()
+
+        # Find the matching account and set the server_id
+        for account in accounts:
+            if account['server']['number'] == self.server_number and account['server']['language'] == self.language:
+                self.server_id = account['id']
+                break
+            elif account['server']['number'] == self.server_number and self.language is None:
+                self.server_id = account['id']
+                self.language = account['server']['language']
+                break
+            else:
+                pass
+
+        if self.server_id is None:
+            raise ValueError("Account not found for the specified server and language.")
+
+    def set_headers_and_cookies(self):
+        # Set the headers
+        self.session.headers.update(
+            {
+                'Accept': 'application/json',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Content-Type': 'application/json',
+            }
+        )
+
+        # Set the cookies
+        cookies = {
+            "gf-token-production": f"{self.token}"
+        }
+
+        self.session.cookies.update(cookies)
+
+    def get_login_link(self, params):
+        if self.is_pioneer == 1:
+            login_link = self.session.post(
+                url="https://lobby-pioneers.ogame.gameforge.com/api/users/me/loginLink",
+                json=params
+            )
+        else:
+            login_link = self.session.post(
+                url="https://lobby.ogame.gameforge.com/api/users/me/loginLink",
+                json=params
+            )
+
+        login_link = login_link.json()
+
+        if len(login_link) < 1:
+            raise ValueError('No LoginLink!')
+
+        return login_link['url']
 
     def test(self):
         import ogame.test
@@ -188,7 +399,7 @@ class OGame(object):
     def attacked(self):
         response = self.session.get(
             url=self.index_php + 'page=componentOnly'
-                '&component=eventList&action=fetchEventBox&ajax=1&asJson=1',
+                                 '&component=eventList&action=fetchEventBox&ajax=1&asJson=1',
             headers={'X-Requested-With': 'XMLHttpRequest'}
         ).json()
         if 0 < response['hostile']:
@@ -199,7 +410,7 @@ class OGame(object):
     def neutral(self):
         response = self.session.get(
             url=self.index_php + 'page=componentOnly'
-                '&component=eventList&action=fetchEventBox&ajax=1&asJson=1',
+                                 '&component=eventList&action=fetchEventBox&ajax=1&asJson=1',
             headers={'X-Requested-With': 'XMLHttpRequest'}
         ).json()
         if 0 < response['neutral']:
@@ -210,7 +421,7 @@ class OGame(object):
     def friendly(self):
         response = self.session.get(
             url=self.index_php + 'page=componentOnly'
-                '&component=eventList&action=fetchEventBox&ajax=1&asJson=1',
+                                 '&component=eventList&action=fetchEventBox&ajax=1&asJson=1',
             headers={'X-Requested-With': 'XMLHttpRequest'}
         ).json()
         if 0 < response['friendly']:
@@ -277,6 +488,7 @@ class OGame(object):
             planets = [int(planet) for planet in planets]
             free = planets[1] - planets[0]
             total = planets[1]
+
         return Slot
 
     def celestial(self, id):
@@ -331,6 +543,7 @@ class OGame(object):
         else:
             shipyard_time = int(shipyard_time.group(1))
             shipyard_time = datetime.now() + timedelta(seconds=shipyard_time)
+
         class Queue:
             research = research_time
             buildings = build_time
@@ -340,6 +553,7 @@ class OGame(object):
                 buildings,
                 shipyard
             ]
+
         return Queue
 
     def celestial_coordinates(self, id):
@@ -376,15 +590,15 @@ class OGame(object):
             deuterium = resources[2]
             day_production = bs4.find(
                 'tr',
-                attrs={'class':'summary'}
+                attrs={'class': 'summary'}
             ).find_all(
                 'td',
-                attrs={'class':'undermark'}
+                attrs={'class': 'undermark'}
             )
             day_production = [
-                int(day_production[0].span['title'].replace('.','')),
-                int(day_production[1].span['title'].replace('.','')),
-                int(day_production[2].span['title'].replace('.',''))
+                int(day_production[0].span['title'].replace('.', '')),
+                int(day_production[1].span['title'].replace('.', '')),
+                int(day_production[2].span['title'].replace('.', ''))
             ]
             storage = bs4.find_all('tr')
             for stor in storage:
@@ -401,22 +615,21 @@ class OGame(object):
 
         return Resources
 
-    def resources_settings(self, id, settings=None):
+    def resources_settings(self, planet_id, settings=None):
         response = self.session.get(
-            self.index_php + 'page=resourceSettings&cp={}'.format(id)
+            self.index_php + 'page=ingame&component=resourcesettings&cp={}'.format(planet_id)
         ).text
         bs4 = BeautifulSoup4(response)
         settings_form = {
             'saveSettings': 1,
         }
-        token = bs4.find('input', {'name':'token'})['value']
+        token = re.search(r'var token\s?=\s?"([^"]*)";', response).group(1)
         settings_form.update({'token': token})
         names = [
-            'last1', 'last2', 'last3', 'last4',
-            'last12', 'last212', 'last217'
+            '1', '2', '3', '4', '12', '212', '217'
         ]
         for building_name in names:
-            select = bs4.find('select', {'name': building_name})
+            select = bs4.find('select', {'name': 'productionFactor[{}]'.format(building_name)})
             selected_value = select.find('option', selected=True)['value']
             settings_form.update({building_name: selected_value})
         if settings is not None:
@@ -450,6 +663,7 @@ class OGame(object):
                 solar_plant, fusion_plant, solar_satellite,
                 crawler
             ]
+
         return Settings
 
     def isPossible(self: str):
@@ -467,7 +681,7 @@ class OGame(object):
     def supply(self, id):
         response = self.session.get(
             url=self.index_php + 'page=ingame&component=supplies&cp={}'
-                .format(id)
+            .format(id)
         ).text
         bs4 = BeautifulSoup4(response)
         levels = [
@@ -535,7 +749,7 @@ class OGame(object):
     def moon_facilities(self, id):
         response = self.session.get(
             url='{}page=ingame&component=facilities&cp={}'
-                .format(self.index_php, id)
+            .format(self.index_php, id)
         ).text
         bs4 = BeautifulSoup4(response)
         levels = [
@@ -802,8 +1016,8 @@ class OGame(object):
             if debris:
                 debris_resources = row.find_all('li', {'class': 'debris-content'})
                 debris_resources = [
-                    int(debris_resources[0].text.split(':')[1].replace('.','')),
-                    int(debris_resources[1].text.split(':')[1].replace('.','')),
+                    int(debris_resources[0].text.split(':')[1].replace('.', '')),
+                    int(debris_resources[1].text.split(':')[1].replace('.', '')),
                     0
                 ]
 
@@ -818,6 +1032,7 @@ class OGame(object):
                     position, has_debris, resources,
                     metal, crystal, deuterium
                 ]
+
             if len(coords) >= 3 and coords[2] == Position.position[2]:
                 return Position
             debris_fields.append(Position)
@@ -878,7 +1093,7 @@ class OGame(object):
             self.index_php + 'page=ingame&component=fleetdispatch'
         ).text
         bs4 = BeautifulSoup4(response)
-        slots = bs4.find('div', attrs={'id':'slots', 'class': 'fleft'})
+        slots = bs4.find('div', attrs={'id': 'slots', 'class': 'fleft'})
         slots = [
             slot.text
             for slot in slots.find_all(class_='fleft')
@@ -1179,9 +1394,9 @@ class OGame(object):
             for tech_type in spied_data.keys():
                 for tech_id, tech_amount in get_tech_and_quantity(tech_type):
                     if tech_type == 'ships' and tech_id in [212, 217]:
-                            tech_name = const.buildings.building_name(
-                                (tech_id, None, None)
-                            )
+                        tech_name = const.buildings.building_name(
+                            (tech_id, None, None)
+                        )
                     else:
                         tech_name = const_data[tech_type][0](
                             (tech_id, None, const_data[tech_type][1])
@@ -1221,7 +1436,7 @@ class OGame(object):
     ):
         response = self.session.get(
             url=self.index_php + 'page=ingame&component=fleetdispatch&cp={}'
-                .format(id)
+            .format(id)
         ).text
         send_fleet_token = re.search('var fleetSendingToken = "(.*)"', response)
         if send_fleet_token is None:
@@ -1251,7 +1466,7 @@ class OGame(object):
         )
         response = self.session.post(
             url=self.index_php + 'page=ingame&component=fleetdispatch'
-                '&action=sendFleet&ajax=1&asJson=1',
+                                 '&action=sendFleet&ajax=1&asJson=1',
             data=form_data,
             headers={'X-Requested-With': 'XMLHttpRequest'}
         ).json()
@@ -1263,7 +1478,7 @@ class OGame(object):
         ).text
         if "return={}".format(fleet_id) in response:
             token = re.search(
-                'return={}'.format(fleet_id)+'&amp;token=(.*)" ', response
+                'return={}'.format(fleet_id) + '&amp;token=(.*)" ', response
             ).group(1).split('"')[0]
             self.session.get(
                 url=''.join([
@@ -1276,27 +1491,30 @@ class OGame(object):
         else:
             return False
 
-    def build(self, what, id):
+    def build(self, what, planet_id):
         type = what[0]
         amount = what[1]
         component = what[2]
         response = self.session.get(
             url=self.index_php +
                 'page=ingame&component={}&cp={}'
-                .format(component, id)
+                .format(component, planet_id)
         ).text
-        build_token = re.search(
-            "var urlQueueAdd = (.*)token=(.*)';",
-            response
-        ).group(2)
-        self.session.get(
-            url=self.index_php,
-            params={'page': 'ingame',
-                    'component': component,
-                    'modus': 1,
-                    'token': build_token,
-                    'type': type,
-                    'menge': amount}
+
+        build_token = re.search(r'var token\s?=\s?"([^"]*)";', response).group(1)
+
+        params = {
+            'technologyId': type,
+            'amount': amount,
+            'mode': 1,
+            'token': build_token
+        }
+
+        self.session.post(
+            url=self.index_php +
+                'page=componentOnly&component=buildlistactions&action=scheduleEntry&asJson=1',
+            data=params,
+            headers={'X-Requested-With': 'XMLHttpRequest'}
         )
 
     def deconstruct(self, what, id):
@@ -1392,125 +1610,351 @@ class OGame(object):
             'https://lobby.ogame.gameforge.com/api/users/me/logout'
         )
         return not OGame.is_logged_in(self)
-    
+
     def buy_offer_of_the_day(self):
-    response = self.session.get(
-        url=self.index_php +
-            'page=ingame&component=traderOverview').text
+        response = self.session.get(
+            url=self.index_php +
+                'page=ingame&component=traderOverview').text
 
-    time.sleep(random.randint(250, 1500)/1000)
+        time.sleep(random.randint(250, 1500) / 1000)
 
-    response2 = self.session.post(
-        url=self.index_php +
-            'page=ajax&component=traderimportexport',
-        data={
-            'show': 'importexport',
-            'ajax': 1
-        },
-        headers={'X-Requested-With': 'XMLHttpRequest'}).text
+        response2 = self.session.post(
+            url=self.index_php +
+                'page=ajax&component=traderimportexport',
+            data={
+                'show': 'importexport',
+                'ajax': 1
+            },
+            headers={'X-Requested-With': 'XMLHttpRequest'}).text
 
-    time.sleep(random.randint(250, 1500) / 1000)
+        time.sleep(random.randint(250, 1500) / 1000)
 
-    bs4 = BeautifulSoup4(response2)
+        bs4 = BeautifulSoup4(response2)
 
-    try:
-        item_available = bs4.find_partial(class_='bargain import_bargain take hidden').text
-        return f'You have already accepted this offer!'
-    except Exception as e:
-        err = e
-    try:
-        item_price = bs4.find_partial(class_='price js_import_price').text
-        item_price = int(item_price.replace('.', ''))
-    except Exception as e:
-        return f'err: {e}, failed to extract offer of the day price'
+        try:
+            item_available = bs4.find_partial(class_='bargain import_bargain take hidden').text
+            return f'You have already accepted this offer!'
+        except Exception as e:
+            err = e
+        try:
+            item_price = bs4.find_partial(class_='price js_import_price').text
+            item_price = int(item_price.replace('.', ''))
+        except Exception as e:
+            return f'err: {e}, failed to extract offer of the day price'
 
-    try:
-        planet_resources = re.search(r'var planetResources\s?=\s?({[^;]*});', response2).group(1)
-        planet_resources = json.loads(planet_resources)
-    except Exception as e:
-        return f'err: {e}, failed to extract offer of the day planet resources'
+        try:
+            planet_resources = re.search(r'var planetResources\s?=\s?({[^;]*});', response2).group(1)
+            planet_resources = json.loads(planet_resources)
+        except Exception as e:
+            return f'err: {e}, failed to extract offer of the day planet resources'
 
-    try:
-        import_token = re.search(r'var importToken\s?=\s?"([^"]*)";', response2).group(1)
-    except Exception as e:
-        return f'err: {e}, failed to extract offer of the day import_token'
+        try:
+            import_token = re.search(r'var importToken\s?=\s?"([^"]*)";', response2).group(1)
+        except Exception as e:
+            return f'err: {e}, failed to extract offer of the day import_token'
 
-    try:
-        multiplier = re.search(r'var multiplier\s?=\s?({[^;]*});', response2).group(1)
-        multiplier = json.loads(multiplier)
-    except Exception as e:
-        return f'err: {e}, failed to extract offer of the day multiplier'
+        try:
+            multiplier = re.search(r'var multiplier\s?=\s?({[^;]*});', response2).group(1)
+            multiplier = json.loads(multiplier)
+        except Exception as e:
+            return f'err: {e}, failed to extract offer of the day multiplier'
 
-    form_data = {'action': 'trade'}
+        form_data = {'action': 'trade'}
 
-    remaining = item_price
+        remaining = item_price
 
-    for celestial in list(planet_resources.keys()):
-        metal_needed = int(planet_resources[celestial]['input']['metal'])
-        if remaining < metal_needed * float(multiplier['metal']):
-            metal_needed = math.ceil(remaining / float(multiplier['metal']))
+        for celestial in list(planet_resources.keys()):
+            metal_needed = int(planet_resources[celestial]['input']['metal'])
+            if remaining < metal_needed * float(multiplier['metal']):
+                metal_needed = math.ceil(remaining / float(multiplier['metal']))
 
-        remaining -= metal_needed * float(multiplier['metal'])
+            remaining -= metal_needed * float(multiplier['metal'])
 
-        crystal_needed = int(planet_resources[celestial]['input']['crystal'])
-        if remaining < crystal_needed * float(multiplier['crystal']):
-            crystal_needed = math.ceil(remaining / float(multiplier['crystal']))
+            crystal_needed = int(planet_resources[celestial]['input']['crystal'])
+            if remaining < crystal_needed * float(multiplier['crystal']):
+                crystal_needed = math.ceil(remaining / float(multiplier['crystal']))
 
-        remaining -= crystal_needed * float(multiplier['crystal'])
+            remaining -= crystal_needed * float(multiplier['crystal'])
 
-        deuterium_needed = int(planet_resources[celestial]['input']['deuterium'])
-        if remaining < deuterium_needed * float(multiplier['deuterium']):
-            deuterium_needed = math.ceil(remaining / float(multiplier['deuterium']))
+            deuterium_needed = int(planet_resources[celestial]['input']['deuterium'])
+            if remaining < deuterium_needed * float(multiplier['deuterium']):
+                deuterium_needed = math.ceil(remaining / float(multiplier['deuterium']))
 
-        remaining -= deuterium_needed * float(multiplier['deuterium'])
+            remaining -= deuterium_needed * float(multiplier['deuterium'])
+
+            form_data.update(
+                {
+                    'bid[planets][{}][metal]'.format(str(celestial)): '{}'.format(int(metal_needed)),
+                    'bid[planets][{}][crystal]'.format(str(celestial)): '{}'.format(str(crystal_needed)),
+                    'bid[planets][{}][deuterium]'.format(str(celestial)): '{}'.format(str(deuterium_needed)),
+                }
+            )
 
         form_data.update(
             {
-                'bid[planets][{}][metal]'.format(str(celestial)): '{}'.format(int(metal_needed)),
-                'bid[planets][{}][crystal]'.format(str(celestial)): '{}'.format(str(crystal_needed)),
-                'bid[planets][{}][deuterium]'.format(str(celestial)): '{}'.format(str(deuterium_needed)),
+                'bid[honor]': '0',
+                'token': '{}'.format(import_token),
+                'ajax': '1'
             }
         )
 
-    form_data.update(
-        {
-            'bid[honor]': '0',
-            'token': '{}'.format(import_token),
+        time.sleep(random.randint(1500, 3000) / 1000)
+
+        response3 = self.session.post(
+            url=self.index_php +
+                'page=ajax&component=traderimportexport&ajax=1&action=trade&asJson=1',
+            data=form_data,
+            headers={'X-Requested-With': 'XMLHttpRequest'}).json()
+
+        try:
+            new_token = response3['newAjaxToken']
+        except Exception as e:
+            return f'err: {e}, failed to extract offer of the day newAjaxToken'
+
+        form_data2 = {
+            'action': 'takeItem',
+            'token': '{}'.format(new_token),
             'ajax': '1'
         }
-    )
 
-    time.sleep(random.randint(1500, 3000) / 1000)
+        time.sleep(random.randint(250, 1500) / 1000)
 
-    response3 = self.session.post(
-        url=self.index_php +
-            'page=ajax&component=traderimportexport&ajax=1&action=trade&asJson=1',
-        data=form_data,
-        headers={'X-Requested-With': 'XMLHttpRequest'}).json()
+        response4 = self.session.post(
+            url=self.index_php +
+                'page=ajax&component=traderimportexport&ajax=1&action=takeItem&asJson=1',
+            data=form_data2,
+            headers={'X-Requested-With': 'XMLHttpRequest'}).json()
 
-    try:
-        new_token = response3['newAjaxToken']
-    except Exception as e:
-        return f'err: {e}, failed to extract offer of the day newAjaxToken'
+        getitem = False
+        if not response4['error']:
+            getitem = True
+        return getitem
 
-    form_data2 = {
-        'action': 'takeItem',
-        'token': '{}'.format(new_token),
-        'ajax': '1'
+
+def solve_captcha(question_raw, icons_raw):
+    hash_values = {
+        "cc6c3193cec65c39": "star",
+        "ccc6713993e664cc": "bulb",
+        "9ad9657131c6d632": "flower",
+        "c36938966c93d36c": "magnet",
+        "9339398e6ce4e68c": "castle",
+        "cccc333336cccc33": "fork",
+        "cf65389bc78e3830": "apple",
+        "8b982c63a69ecb69": "sun",
+        "cbd9313232c6ce99": "cherry",
+        "964f69b49443db58": "bicycle",
+        "98d3673c646c9ac6": "pencils",
+        "cf4d30c2cd92b339": "keys",
+        "926d6493d96c3699": "scissors",
+        "d8c9a736c89c2e63": "pirate flag",
+        "cfcb3034c3938ecc": "orange",
+        "cc2833c7ce999966": "raindrop",
+        "9b3964c6ce3991b1": "cloud",
+        "cec630393363cec6": "ballon",
+        "c4313bcec531ce66": "crown",
+        "c93332cc6733339c": "candle",
+        "c5391ac76f64903b": "laptop",
+        "c6ce3931c661c6ce": "book",
+        "9293696ec7859c63": "fried egg",
+        "e4999b66646d6499": "top hat",
+        "91b66a4995b668d9": "glasses",
+        "cbc66c3892e3cccc": "dice",
+        "cc9c3363cc9c7163": "planet",
+        "cc6c33936c6c9a39": "bell",
+        "9696314d4c79b396": "carrot",
+        "909a6f65909ac7e3": "gamepad",
+        "c766388c6399ce66": "moon",
+        "8c8e7331c5cf26cc": "globe",
+        "cbc63c383322cdcd": "doughnut",
+        "8e93696c33939696": "tree",
+        "c3cb3c34c3cb9c2c": "rainbow",
+        "cc3333cc66669966": "bottle",
+        "cccc333132c7d31b": "ice cream",
+        "999b6664339b88ce": "paintbrush",
+        "869b3964339bce2c": "hamburger",
+        "cfc7303882c7cd3a": "heart",
+        "92366dc93266cd39": "banana",
+        "c43d37c3584e7073": "guitar",
+        "9a666599c3649e66": "mug",
+        "c36d3c92c3cd3c92": "sailling",
     }
 
-    time.sleep(random.randint(250, 1500) / 1000)
+    # paths
+    path_of_the_directory_captchas = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'captcha', 'captchas')
+    path_of_the_directory_questions = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'captcha', 'questions')
 
-    response4 = self.session.post(
-        url=self.index_php +
-            'page=ajax&component=traderimportexport&ajax=1&action=takeItem&asJson=1',
-        data=form_data2,
-        headers={'X-Requested-With': 'XMLHttpRequest'}).json()
+    try:
+        os.makedirs(path_of_the_directory_captchas)
+    except FileExistsError:
+        pass
+    try:
+        os.makedirs(path_of_the_directory_questions)
+    except FileExistsError:
+        pass
 
-    getitem = False
-    if not response4['error']:
-        getitem = True
-    return getitem
+    final_answer = -1
+    answer_list = []
+    answer_dict = {}
+
+    in_memory_file = io.BytesIO(icons_raw)
+    img = Image.open(in_memory_file)
+
+    # size of images
+    left = 0
+    top = 0
+    right = 60
+    bottom = 60
+
+    # cut icons into pieces and create hash
+    i = 0
+    while i < 4:
+        img_res = img.crop((left, top, right, bottom))
+        newsize = (100, 100)
+        img_res = img_res.resize(newsize)
+        img_res = img_res.save(os.path.join(path_of_the_directory_captchas, "captcha_" + str(i) + ".png"))
+
+        # create hash
+        hash_img = imagehash.phash(
+            Image.open(os.path.join(path_of_the_directory_captchas, "captcha_" + str(i) + ".png")))
+
+        # save file with hash as name
+        shutil.copy(os.path.join(path_of_the_directory_captchas, "captcha_" + str(i) + ".png"),
+                    os.path.join(path_of_the_directory_captchas, str(hash_img) + ".png"))
+
+        try:
+            answer_list.append(hash_values[str(hash_img)])
+            answer_dict.update({hash_values[str(hash_img)]: i})
+        except KeyError:
+            print(f'DEBUG found no word for hash {hash_img}')
+
+        right = right + 60
+        left = left + 60
+        i = i + 1
+
+    # get question with OCR
+    with open(os.path.join(path_of_the_directory_questions, "question.png"), "wb") as file:
+        file.write(question_raw)
+
+    img = cv2.imread(os.path.join(path_of_the_directory_questions, "question.png"))
+    scale_percent = 160  # percent of original size
+    width = int(img.shape[1] * scale_percent / 100)
+    height = int(img.shape[0] * scale_percent / 100)
+    dim = (width, height)
+    # resize image
+    resized = cv2.resize(img, dim, interpolation=cv2.INTER_AREA)
+    gry = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.threshold(gry, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    txt = image_to_string(thresh)
+    word_captcha = txt.lower().strip().strip(',.').replace('\n', ' ').replace('\r', '')
+    try:
+        shutil.copy(os.path.join(path_of_the_directory_questions, "question.png"),
+                    os.path.join(path_of_the_directory_questions, str(word_captcha) + ".png"))
+    except Exception as e:
+        print(f'error copy question {e}')
+
+    # get final answer
+    for answer in answer_list:
+        if answer in word_captcha:
+            final_answer = answer_dict[answer]
+
+    if final_answer >= 0:
+        print(f'answer found: {final_answer}')
+        return final_answer
+    else:
+        final_answer = 0
+        print(f'no answer found, use: {final_answer}')
+        return final_answer
+
+
+# Blackbox
+def encode_uri_component(s):
+    return quote(s, safe="!~*'()")
+
+
+def pseudo_b64(s):
+    lut = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_="
+    len_mod3 = len(s) % 3
+    out = ""
+    for i in range(0, len(s), 3):
+        c1 = ord(s[i])
+        c2 = ord(s[i + 1]) if i + 1 < len(s) else 0
+        c3 = ord(s[i + 2]) if i + 2 < len(s) else 0
+        t = c1 << 16 | c2 << 8 | c3
+        out += lut[t >> 18 & 63] + lut[t >> 12 & 63] + lut[t >> 6 & 63] + lut[t & 63]
+    return out[:len_mod3 - 3] if len_mod3 > 0 else out
+
+
+def encrypt(s):
+    s = encode_uri_component(s)
+    out = s[0]
+    for i in range(1, len(s)):
+        out += chr((ord(out[i - 1]) + ord(s[i])) % 256)
+    return pseudo_b64(out)
+
+
+def js_iso_time(d):
+    return d.isoformat()[:23] + "Z"
+
+
+def get_vector(d):
+    def rand_char() -> str:
+        return chr(int(32 + random.random() * 94))
+
+    def gen_new_xvec() -> str:
+        part1 = "".join(rand_char() for _ in range(100))
+        ts = str(int(d.timestamp() * 1000))
+        return f"{part1} {ts}"
+
+    x_vec = gen_new_xvec()
+    x_vec_b64 = base64.standard_b64encode(x_vec.encode()).decode()
+
+    return x_vec_b64
+
+
+def get_blackbox():
+    obj = {
+        "v": 8,  # Version
+        "tz": "Europe/Berlin",  # Timezone
+        "dnt": False,  # do not track
+        "product": "Blink",
+        "osType": "Windows",
+        "app": "Blink",
+        "vendor": "Google Inc.",
+        "mem": 8,
+        "con": 4,
+        "lang": "de-DE,de,en-US,en",
+        "plugins": "f473d473013d58cee78732e974dd4af2e8d0105449c384658cbf1505e40ede50",
+        "gpu": "Google Inc. (Intel),ANGLE (Intel, Intel(R) HD Graphics 530 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "fonts": "67574c80452bcc244b31e19a66a5f4768b48be6d88dfc462d5fa7d8570ed87da",
+        "audioC": "c6a7feda4a58521c20f9ffd946a0ce3edfac57a54e35e73857e710c85a9e4415",
+        "width": 1900,
+        "height": 1080,
+        "depth": 24,
+        "lStore": True,
+        "sStore": True,
+        "video": "1f03b77fda33742261bea0d27e6423bf22d2bf57febc53ae75b962f6e523cc02",
+        "audio": "c76e22cc6aa9f5a659891983b77cd085a3634dd6f6938827ab5a4c6c61a628e5",
+        "media": "d15bbda6b8af6297ea17f2fb6a724d3bacde9b2e1285a951ee148e4cd5cc452c",
+        "permissions": "86beeaf2f319e30b7dfedc65ccb902a989a210ffb3d4648c80bd0921aa0a2932",
+        "audioFP": 35.738334245979786,
+        "webglFP": "7d6f8162c7c6be70d191585fd163f34dbc404a8b4f6fcad4d2e660c7b4e4b694",
+        "canvasFP": 732998116,
+        "creation": js_iso_time(datetime.utcnow()),
+        "uuid": "ajs3innzou3hulixyriljvj89by",
+        "d": randint(300, 500),  # how long it took to collect data
+        "osVersion": "10",
+        "vector": get_vector(datetime.now()),
+        "userAgent": user_agent_raw,
+        "serverTimeInMS": js_iso_time(datetime.utcnow().replace(microsecond=1)),
+        "request": None
+    }
+
+    en_obj = []
+    for k, v in obj.items():
+        en_obj.append(v)
+
+    en_obj = json.dumps(en_obj, separators=(",", ":"))
+    return encrypt(en_obj)
 
 
 def BeautifulSoup4(response):
