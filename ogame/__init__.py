@@ -1590,6 +1590,20 @@ class OGame(object):
         else:
             return True
 
+    def is_logged_in_uni(self):
+        try:
+            response = self.session.get(
+                url=self.index_php
+            ).text
+            if 'Player' not in str(response):
+                print("is_logged_in_uni: False")
+                return False
+            else:
+                # print("is_logged_in_uni: True")
+                return True
+        except Exception as e:
+            return False
+
     def relogin(self, universe=None):
         if universe is None:
             universe = self.universe
