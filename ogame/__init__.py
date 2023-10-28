@@ -1913,7 +1913,7 @@ def get_vector(d):
 
 def get_blackbox():
     obj = {
-        "v": 8,  # Version
+        "v": 9,  # Version
         "tz": "Europe/Berlin",  # Timezone
         "dnt": False,  # do not track
         "product": "Blink",
@@ -1930,8 +1930,8 @@ def get_blackbox():
         "width": 1900,
         "height": 1080,
         "depth": 24,
-        "lStore": True,
-        "sStore": True,
+        # "lStore": True,
+        # "sStore": True,
         "video": "1f03b77fda33742261bea0d27e6423bf22d2bf57febc53ae75b962f6e523cc02",
         "audio": "c76e22cc6aa9f5a659891983b77cd085a3634dd6f6938827ab5a4c6c61a628e5",
         "media": "d15bbda6b8af6297ea17f2fb6a724d3bacde9b2e1285a951ee148e4cd5cc452c",
