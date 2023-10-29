@@ -1885,6 +1885,46 @@ class OGame(object):
             getitem = True
         return getitem
 
+    def yeast(self, num):
+        alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
+        length = len(alphabet)
+        encoded = ""
+        while num > 0:
+            encoded = str(alphabet[int(num % length)]) + encoded
+            num = int(math.floor(float(num / length)))
+        return encoded
+
+    def websocket_init(self):
+        response = self.session.get(
+            url=self.index_php +
+                'page=ingame&component=traderOverview').text
+
+        try:
+            chathost = re.search(r'var nodeUrl\s?=\s?"https:\\/\\/([^:]+):(\d+)\\/socket.io\\/socket.io.js"',
+                                 response).group(1)
+
+            chatport = re.search(r'var nodeUrl\s?=\s?"https:\\/\\/([^:]+):(\d+)\\/socket.io\\/socket.io.js"',
+                                 response).group(2)
+
+        except Exception as e:
+            return f'err: {e}, failed to extract Chat Host and Port'
+
+        dt = datetime.now(timezone.utc)
+        utc_timestamp = dt.timestamp()
+        token = self.yeast(utc_timestamp * 1000)
+
+        url_combined = f'https://{chathost}:{chatport}/socket.io/?EIO=4&transport=polling&t={token}' \
+            .format(chathost=chathost, chatport=chatport, token=token)
+
+        response2 = self.session.get(
+            url=url_combined,
+            data='40/chat,',
+        ).text
+
+        sid = re.search(r'"sid":"([^"]+)"', response2).group(1)
+
+        return chathost, chatport, token, sid
+
 
 def solve_captcha(question_raw, icons_raw):
     hash_values = {
