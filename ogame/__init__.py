@@ -918,78 +918,219 @@ class OGame(object):
         response = self.session.post(
             url=self.index_php + 'page=ingame&component=galaxyContent&ajax=1',
             data={'galaxy': coords[0], 'system': coords[1]},
-            headers={'X-Requested-With': 'XMLHttpRequest'}
-        ).json()
-        bs4 = BeautifulSoup4(response['galaxy'])
+            headers={
+                'X-Requested-With': 'XMLHttpRequest',
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            }
+        )
 
-        def playerId(tag):
-            numbers = re.search(r'[0-9]+', tag).group()
-            return int(numbers)
+        if response.status_code == 200:
+            try:
+                response = response.json()
+                bs4 = BeautifulSoup4(response['galaxy'])
 
-        players = bs4.find_all_partial(id='player')
-        player_name = {
-            playerId(player['id']): player.h1.span.text
-            for player in players
-        }
-        player_rank = {
-            playerId(player['id']): int(player.a.text)
-            for player in players if player.a.text.isdigit()
-        }
+                def playerId(tag):
+                    numbers = re.search(r'[0-9]+', tag).group()
+                    return int(numbers)
 
-        alliances = bs4.find_all_partial(id='alliance')
-        alliance_name = {
-            playerId(alliance['id']): alliance.h1.text.strip()
-            for alliance in alliances
-        }
+                players = bs4.find_all_partial(id='player')
 
-        planets = []
-        for row in bs4.select('#galaxytable .row'):
-            status = row['class']
-            status.remove('row')
-            if 'empty_filter' in status:
-                continue
-            elif len(status) == 0:
-                planet_status = [const.status.yourself]
-                pid = self.player_id
-                player_name[pid] = self.player
-            else:
-                planet_status = [
-                    re.search('(.*)_filter', sta).group(1)
-                    for sta in status
-                ]
+                player_names = {
+                    playerId(player['id']): player.h1.span.text
+                    for player in players
+                }
 
-                player = row.find(rel=re.compile(r'player[0-9]+'))
-                if not player:
-                    continue
-                pid = playerId(player['rel'][0])
-                if pid == const.status.destroyed:
-                    continue
+                player_rank = {
+                    playerId(player['id']): int(player.a.text)
+                    for player in players if player.a.text.isdigit()
+                }
 
-            planet = int(row.find(class_='position').text)
-            planet_cord = const.coordinates(coords[0], coords[1], int(planet))
-            moon_pos = row.find(rel=re.compile(r'moon[0-9]*'))
+                alliances = bs4.find_all_partial(id='alliance')
+                alliance_name = {
+                    playerId(alliance['id']): alliance.h1.text.strip()
+                    for alliance in alliances
+                }
 
-            alliance_id = row.find(rel=re.compile(r'alliance[0-9]+'))
-            alliance_id = playerId(
-                alliance_id['rel']) if alliance_id else None
+                planets = []
+                for row in bs4.select('#galaxytable .row'):
+                    status = row['class']
+                    status.remove('row')
+                    if 'empty_filter' in status:
+                        continue
+                    elif len(status) == 0 and 'administrator' not in str(row).lower():
+                        planet_status = [const.status.yourself]
+                        pid = self.player_id
+                        player_names[pid] = self.player
+                    else:
+                        planet_status = [
+                            re.search('(.*)_filter', sta).group(1)
+                            for sta in status
+                        ]
 
-            class Position:
-                position = planet_cord
-                name = row.find(id=re.compile(r'planet[0-9]+')).h1.span.text
-                player = player_name[pid]
-                player_id = pid
-                rank = player_rank.get(pid)
-                status = planet_status
-                moon = moon_pos is not None
-                alliance = alliance_name.get(alliance_id)
-                list = [
-                    name, position, player,
-                    player_id, rank, status, moon, alliance
-                ]
+                        player = row.find(rel=re.compile(r'player[0-9]+'))
+                        if not player:
+                            continue
+                        pid = playerId(player['rel'][0])
+                        if pid == const.status.destroyed:
+                            continue
 
-            planets.append(Position)
+                    planet_timer_row = None
+                    if row.find(class_='activity showMinutes tooltip js_hideTipOnMobile') is not None:
+                        planet_timer_row = row.find(
+                            class_='activity showMinutes tooltip js_hideTipOnMobile').text.strip()
+                    elif row.find(class_='activity') is not None:
+                        planet_timer_row = '15'
+                    else:
+                        planet_timer_row = 'None'
 
-        return planets
+                    planet = int(row.find(class_='position').text)
+                    planet_cord = const.coordinates(coords[0], coords[1], int(planet))
+
+                    alliance_id = row.find(rel=re.compile(r'alliance[0-9]+'))
+                    alliance_id = playerId(
+                        alliance_id['rel']) if alliance_id else None
+
+                    debris_resources = [0, 0, 0]
+                    try:
+                        debris_resources = row.find_all('li', {'class': 'debris-content'})
+                        debris_resources = [
+                            int(debris_resources[0].text.split(':')[1].replace('.', '')),
+                            int(debris_resources[1].text.split(':')[1].replace('.', '')),
+                            0
+                        ]
+                    except:
+                        debris_resources = [0, 0, 0]
+
+                    try:
+                        recyclers_needed = row.select_one(
+                            "div#debris" + str(planet) + " ul.ListLinks li:nth-child(3)").text
+                        recyclers_needed = recyclers_needed = int(re.search(r'\d+', recyclers_needed).group())
+                    except:
+                        recyclers_needed = None
+
+                    planet_id_row = None
+                    if row.find('td', {'class': "colonized"}).has_attr('data-planet-id'):
+                        planet_id_row = row.find('td', {'class': "colonized"}).attrs['data-planet-id']
+
+                    inactive_row = False
+                    if 'inactive_filter' in str(row):
+                        inactive_row = True
+
+                    strong_player_row = False
+                    if row.find('span', class_='status_abbr_strong') is not None:
+                        strong_player_row = True
+
+                    newbie_row = False
+                    if row.find(class_='newbie_filter') is not None:
+                        newbie_row = True
+
+                    vacation_row = False
+                    if 'vacation_filter' in str(row):
+                        vacation_row = True
+
+                    honorable_target_row = False
+                    if row.find('span', class_='status_abbr_honorableTarget') is not None:
+                        honorable_target_row = True
+
+                    administrator_row = False
+                    if row.find('span', class_='status_abbr_admin') is not None:
+                        administrator_row = True
+
+                    banned_row = False
+                    if row.find('span', class_='status_abbr_banned') is not None:
+                        banned_row = True
+
+                    is_bandit_row = False
+                    if row.find(class_=['rank_bandit1', 'rank_bandit2', 'rank_bandit3']) is not None:
+                        is_bandit_row = True
+
+                    is_starlord_row = False
+                    if row.find(class_=['rank_starlord1', 'rank_starlord2', 'rank_starlord3']) is not None:
+                        is_starlord_row = True
+
+                    is_outlaw_row = False
+                    if row.find('span', class_='status_abbr_outlaw') is not None:
+                        is_outlaw_row = True
+
+                    # Moon Info
+                    moon_id_row = 0
+                    if row.find('td', {'class': "moon"}).has_attr('data-moon-id'):
+                        moon_id_row = row.find('td', {'class': "moon"}).attrs['data-moon-id']
+
+                    moon_pos = row.find(rel=re.compile(r'moon[0-9]*'))
+
+                    moon_activity_row = 0
+                    moon_size_row = 0
+                    if int(moon_id_row) > 0:
+                        if row.select_one("td.moon div.activity") is not None:
+                            moon_activity_row = None
+                            if row.find(class_=re.compile(r'alert_triangle')) is not None:
+                                moon_activity_row = 15
+                            else:
+                                moon_activity_row = row.select_one("td.moon div.activity").text.strip()
+
+                        # Moon size
+                        moon_size_row = int(row.select_one("td.moon span#moonsize").text.split()[0])
+
+                    debris_16 = bs4.find(class_="expeditionDebrisSlotBox")
+                    if debris_16:
+                        debris_data = debris_16.find(class_='ListLinks').text.replace(".", "")
+                        debris_16 = [int(data) for data in re.findall(r'\d+', debris_data)]
+                    else:
+                        debris_16 = [0, 0, 0]  # [met, kris, pf]
+
+                    class Position:
+                        coordinates = planet_cord
+                        galaxy = planet_cord[0]
+                        system = planet_cord[1]
+                        position = planet_cord[2]
+                        planet_name = row.find(id=re.compile(r'planet[0-9]+')).h1.span.text
+                        player_name = player_names[pid]
+                        player_id = pid
+                        rank = player_rank.get(pid)
+                        status = planet_status
+                        has_moon = moon_pos is not None
+                        alliance = alliance_name.get(alliance_id)
+                        alli_id = alliance_id
+                        planet_activity = planet_timer_row
+                        moon_activity = moon_activity_row
+                        planet_df = debris_resources[:2]
+                        planet_df_m = debris_resources[0]
+                        planet_df_c = debris_resources[1]
+                        planet_recyclers_needed = recyclers_needed
+                        planet_id = planet_id_row
+                        moon_size = moon_size_row
+                        moon_id = moon_id_row
+                        inactive = inactive_row
+                        strong_player = strong_player_row
+                        newbie = newbie_row
+                        vacation = vacation_row
+                        honorable_target = honorable_target_row
+                        administrator = administrator_row
+                        banned = banned_row
+                        is_bandit = is_bandit_row
+                        is_starlord = is_starlord_row
+                        is_outlaw = is_outlaw_row
+                        expedition_debris = debris_16[:2]
+                        needed_pf = debris_16[2]
+                        list = [
+                            coordinates, galaxy, system, position, planet_id, planet_name, player_name, player_id, rank,
+                            status,
+                            has_moon, alliance,
+                            planet_activity,
+                            moon_activity, planet_df, planet_df_m, planet_df_c, planet_recyclers_needed, moon_size,
+                            moon_id, inactive, strong_player, newbie, vacation, honorable_target, administrator, banned,
+                            is_bandit, is_starlord, is_outlaw, expedition_debris, needed_pf
+                        ]
+
+                    planets.append(Position)
+
+                return planets
+            except Exception as galaxy_e:
+                print(f'error galaxy: {galaxy_e}')
+        else:
+            print("error galaxy scan")
+            return []
 
     def galaxy_debris(self, coords):
         response = self.session.post(
