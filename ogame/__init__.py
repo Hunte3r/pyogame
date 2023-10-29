@@ -1268,6 +1268,101 @@ class OGame(object):
     def shop(self):
         raise NotImplementedError("function not implemented yet PLS contribute")
 
+    def shop_items(self):
+        raw = self.landing_page.find('head')
+        item_list = re.search(r'var itemNames = (.*);', str(raw)).group(1)
+        json_list = json.loads(item_list)
+        listofelems = [[value, key] for key, value in json_list.items()]
+        item_duration = [" 7d", " 30d", " 90d"]
+        for count, elem in enumerate(listofelems):
+            index = max(count - 1, 0)
+            if 87 > count > 1:
+                if elem[0] == listofelems[index][0]:
+                    if item_duration[0] in listofelems[max(index - 1, 0)][0]:
+                        listofelems[index][0] = elem[0] + item_duration[1]
+                    else:
+                        listofelems[index][0] = elem[0] + item_duration[0]
+                else:
+                    if listofelems[index][0][:9] == listofelems[max(index - 1, 0)][0][:9]:
+                        listofelems[index][0] = listofelems[index][0] + item_duration[2]
+        return listofelems
+
+    def buy_item(self, id, activate_it=False):
+        response = self.session.get(
+            url=self.index_php + 'page=shop&ajax=1&type={}'.format(id),
+            headers={'X-Requested-With': 'XMLHttpRequest'}
+        ).text
+        if activate_it:
+            activateToken = re.search(r'var token\s?=\s?"([^"]*)";', str(response)).group(1)
+            response2 = self.session.post(
+                url=self.index_php + 'page=inventory',
+                data={'ajax': 1,
+                      'token': activateToken,
+                      'referrerPage': "ingame",
+                      'buyAndActivate': id},
+                headers={'X-Requested-With': 'XMLHttpRequest'}
+            ).json()
+        else:
+            buyToken = re.search(r'var token\s?=\s?"([^"]*)";', str(response)).group(1)
+            response2 = self.session.post(
+                url=self.index_php + 'page=buyitem&item={}'.format(id),
+                data={'ajax': 1,
+                      'token': buyToken},
+                headers={'X-Requested-With': 'XMLHttpRequest'}
+            ).json()
+        list = []
+        if not response2['error']:
+            if activate_it:
+                item_data = response2['message']['item']
+            else:
+                item_data = response2['item']
+
+            class Item:
+                name = item_data['name']
+                costs = int(item_data['costs'])
+                duration = int(item_data['duration'])
+                effect = item_data['effect']
+                amount = int(item_data['amount'])
+                list = [
+                    name, costs, duration, effect, amount
+                ]
+
+            return Item
+        else:
+            return False
+
+    def activate_item(self, id):
+        response = self.session.get(
+            url=self.index_php + 'page=shop&ajax=1&type={}'.format(id),
+            headers={'X-Requested-With': 'XMLHttpRequest'}
+        ).text
+        activateToken = re.search(r'var token\s?=\s?"([^"]*)";', str(response)).group(1)
+        response2 = self.session.post(
+            url=self.index_php + 'page=inventory&item={}&ajax=1'.format(id),
+            data={'ajax': 1,
+                  'token': activateToken,
+                  'referrerPage': "shop"},
+            headers={'X-Requested-With': 'XMLHttpRequest'}
+        ).json()
+        list = []
+        if not response2['error']:
+            item_data = response2['message']['item']
+
+            class Item:
+                name = item_data['name']
+                costs = int(item_data['costs'])
+                duration = int(item_data['duration'])
+                effect = item_data['effect']
+                canbeused = bool(item_data['canBeActivated'])
+                amount = int(item_data['amount'])
+                list = [
+                    name, costs, duration, effect, canbeused, amount
+                ]
+
+            return Item
+        else:
+            return False
+
     def fleet_coordinates(self, event, Coords):
         coordinate = [
             coords.find(class_=Coords).a.text
