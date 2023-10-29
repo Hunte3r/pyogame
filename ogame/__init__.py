@@ -429,6 +429,35 @@ class OGame(object):
         else:
             return False
 
+    def highscore(self, page=1):
+        data = {
+            'page': 'highscoreContent',
+            'category': '1',
+            'type': '0',
+            'site': str(page)
+        }
+        response = self.session.post(
+            url=self.index_php,
+            params=data,
+            headers={'X-Requested-With': 'XMLHttpRequest'}
+        )
+        bs4 = BeautifulSoup4(response.content)
+        player_list = []
+        for i in range(1, 101):
+            rawy = bs4.select('tr', attrs={'class': ''})[i]
+
+            class PlayerData:
+                name = rawy.find('span', attrs={'class': 'playername'}).text.strip()
+                player_id = int(rawy['id'].replace("position", ""))
+                rank = int(rawy.find('td', attrs={'class': 'position'}).text.strip())
+                points = int(rawy.find('td', attrs={'class': 'score'}).text.strip().replace(".", "").replace(",", ""))
+                list = [
+                    name, player_id, rank, points
+                ]
+
+            player_list.append(PlayerData)
+        return player_list
+
     def character_class(self):
         character = self.landing_page.find_partial(
             class_='sprite characterclass medium')
