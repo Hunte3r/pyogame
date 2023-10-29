@@ -463,6 +463,40 @@ class OGame(object):
             class_='sprite characterclass medium')
         return character['class'][3]
 
+    def choose_character_class(self, classid):  # "1"-miner # "2"-warrior # "3"-explorer
+        character = self.landing_page.find_partial(
+            class_='sprite characterclass medium')
+        data = {
+            'page': "ingame",
+            'component': "characterclassselection",
+            'characterClassId': classid,
+            'action': "selectClass",
+            'ajax': '1',
+            'asJson': '1'
+        }
+        if character['class'][3] == 'none':
+            response = self.session.post(
+                url=self.index_php,
+                params=data,
+                headers={'X-Requested-With': 'XMLHttpRequest'}
+            ).json()
+            if response['status'] == 'success':
+                return True
+        return False
+
+    def lf_character_class(self, planet_id):
+        response_class = self.session.get(
+            url=self.index_php + 'page=ingame&component=overview',
+            params={'cp': planet_id}
+        ).text
+        response_class = BeautifulSoup4(response_class)
+        lf_character_class = response_class.find_partial(
+            class_='lifeform-item-icon small')
+        if lf_character_class:
+            return lf_character_class['class'][2]
+        else:
+            return None
+
     def rank(self):
         rank = self.landing_page.find(id='bar')
         rank = rank.find_all('li')[1].text
