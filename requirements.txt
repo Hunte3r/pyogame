@@ -8,7 +8,7 @@ ImageHash==4.3.1
 numpy==1.26.0
 opencv-python==4.8.1.78
 packaging==23.1
-Pillow==10.0.1
+Pillow==10.2.0
 pytesseract==0.3.10
 PyWavelets==1.4.1
 requests==2.31.0
